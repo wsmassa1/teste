@@ -58,6 +58,11 @@ pub struct Host {
     /// explicitly empty value means the working directory. `None` when the
     /// variable is unset; `Host::settings_path` falls through then.
     pub config_dir_override: Option<PathBuf>,
+    /// The platform config dir, when a test injects one. `None` in
+    /// production: `settings_path` then uses the engine's `config_dir()`,
+    /// exactly the fallback `Settings::path()` uses. Tests inject a dir
+    /// under their temporary home so they never touch the real one.
+    pub platform_config_dir: Option<PathBuf>,
 }
 
 impl Host {
@@ -73,7 +78,7 @@ impl Host {
             .unwrap_or_else(|| PathBuf::from("."));
         let env = Self::capture_env(ENV_KEYS.iter().filter_map(|k| std::env::var(k).ok().map(|v| (*k, v))));
         let config_dir_override = std::env::var_os("CRAFT_ANYTHING_CONFIG_DIR").map(PathBuf::from);
-        Host { home, env, os: Os::current(), config_dir_override }
+        Host { home, env, os: Os::current(), config_dir_override, platform_config_dir: None }
     }
 
     /// The config-related environment variables for this host, from
@@ -86,9 +91,13 @@ impl Host {
         pairs.filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.to_string(), v)).collect()
     }
 
-    /// A host rooted at `home` with no environment overrides (tests).
+    /// A host rooted at `home` with no environment overrides (tests). The
+    /// platform config dir is injected under `home`, so `settings_path`
+    /// never touches the real one.
     pub fn with_home(home: impl Into<PathBuf>) -> Host {
-        Host { home: home.into(), env: BTreeMap::new(), os: Os::current(), config_dir_override: None }
+        let home = home.into();
+        let platform_config_dir = Some(home.join(".config").join("craft-anything"));
+        Host { home, env: BTreeMap::new(), os: Os::current(), config_dir_override: None, platform_config_dir }
     }
 
     pub fn var(&self, k: &str) -> Option<PathBuf> {
@@ -127,8 +136,13 @@ impl Host {
     /// override is read from `config_dir_override`, captured with `var_os`:
     /// a non-UTF-8 path stays usable, and an explicitly empty value means the
     /// working directory, so the config there is the live one, not the
-    /// platform fallback. A host with no override (tests) falls through to the
-    /// platform dir.
+    /// platform fallback. The platform fallback is the engine's own
+    /// `config_dir()`, not a re-derivation from `APPDATA`/`XDG_CONFIG_HOME`,
+    /// which can disagree with it: on Windows the engine reads the Known
+    /// Folder path while `APPDATA` is only an environment variable, and on
+    /// Linux a relative or non-UTF-8 `XDG_CONFIG_HOME` is ignored by the
+    /// engine but was expanded by us. A test host injects its platform dir
+    /// through `platform_config_dir`.
     pub fn settings_path(&self) -> PathBuf {
         if let Some(dir) = &self.config_dir_override {
             return dir.join("config.toml");
@@ -138,7 +152,20 @@ impl Host {
         {
             return exe_dir.join("CraftAnythingData").join("config.toml");
         }
-        self.app_data().join("craft-anything").join("config.toml")
+        self.platform_config_dir().join("config.toml")
+    }
+
+    /// The platform config dir: the engine's `config_dir()` — exactly the
+    /// fallback `Settings::path()` uses when there is no override or
+    /// portable marker (`dirs::config_dir()/craft-anything`, or
+    /// `.craft-anything` when the platform has none). A test host injects
+    /// its own dir through `platform_config_dir`, so tests never touch the
+    /// real one.
+    fn platform_config_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.platform_config_dir {
+            return dir.clone();
+        }
+        craft_anything_engine::settings::config_dir()
     }
 
     /// The shared skills folder used by clients without their own.

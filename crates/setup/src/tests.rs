@@ -419,6 +419,25 @@ fn host_env_drops_empty_values() {
 }
 
 #[test]
+fn settings_path_matches_engine_config_dir_without_override() {
+    // No override and no injected platform dir: the fallback must be the
+    // engine's own `config_dir()`, exactly the file the app loads. A
+    // relative XDG_CONFIG_HOME in the host env must not steer it — the
+    // engine ignores relative values, and so must we.
+    let mut host = Host::with_home("/home/u");
+    host.config_dir_override = None;
+    host.platform_config_dir = None;
+    host.env.insert("XDG_CONFIG_HOME".to_string(), "rel/xdg".to_string());
+    assert_eq!(host.settings_path(), craft_anything_engine::settings::config_dir().join("config.toml"));
+}
+
+#[test]
+fn settings_path_uses_injected_platform_dir() {
+    let host = Host::with_home("/home/u");
+    assert_eq!(host.settings_path(), PathBuf::from("/home/u/.config/craft-anything/config.toml"));
+}
+
+#[test]
 fn uninstall_neutralizes_config_in_working_directory_when_config_dir_is_empty() {
     let fx = fixture();
     // With CRAFT_ANYTHING_CONFIG_DIR empty the app loads ./config.toml, so
