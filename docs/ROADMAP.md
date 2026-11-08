@@ -282,6 +282,10 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
 - [x] Limit the decision line above to what was measured (one RX 6900 XT, one driver, one Windows
       build) and say other Radeons and drivers aren't checked (#912 review)
       — claimed: 00xJS, branch docs/r5.2-radeon-idle-scope
+- [x] `cargo xtask secrets` read `GIT_AUTHOR_NAME` as a secret (its name holds "AUTH"), so the
+      commit hook refused a roadmap claim by anyone whose name is 12 characters or longer; an
+      author's name and email aren't secrets
+      — claimed: StrongTheDev, branch bugfix/xtask-secrets-git-author
 
 ### R5.3 A builder that can't make progress stops
 Owner: open · Status: todo

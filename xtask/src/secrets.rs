@@ -105,9 +105,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 fn env_values() -> Vec<(String, String)> {
     let mut v = Vec::new();
     for (k, val) in std::env::vars() {
-        let up = k.to_ascii_uppercase();
-        let secret = ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH"].iter().any(|w| up.contains(w));
-        if secret && val.len() >= 12 && !val.contains(['/', '\\']) {
+        if secret_name(&k) && val.len() >= 12 && !val.contains(['/', '\\']) {
             v.push((k, val));
         }
     }
@@ -121,6 +119,13 @@ fn env_values() -> Vec<(String, String)> {
         }
     }
     v
+}
+
+/// A variable named like it holds a secret. An author isn't one: git sets `GIT_AUTHOR_NAME` and
+/// `GIT_AUTHOR_EMAIL` for the commit hook, and the roadmap's claims carry that name.
+fn secret_name(k: &str) -> bool {
+    let up = k.to_ascii_uppercase().replace("AUTHOR", "");
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH"].iter().any(|w| up.contains(w))
 }
 
 fn path_problem(rel: &str) -> Option<String> {
@@ -206,5 +211,17 @@ mod tests {
         assert!(path_problem(".env").is_some() && path_problem("a/.env.local").is_some() && path_problem("log/devlog.md").is_some());
         assert!(path_problem("certs/server.pem").is_some() && path_problem(".claude/settings.local.json").is_some());
         assert!(path_problem("crates/ai/src/keys.rs").is_none() && path_problem("docs/environment.md").is_none());
+    }
+
+    /// A claim names its author, and git hands the hook that name as `GIT_AUTHOR_NAME`: a
+    /// 12-character name was refused as "this machine's secret".
+    #[test]
+    fn a_commit_authors_name_is_not_a_secret() {
+        for k in ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "AUTHOR"] {
+            assert!(!secret_name(k), "{k}");
+        }
+        for k in ["GH_TOKEN", "ANTHROPIC_API_KEY", "BASIC_AUTH", "OAUTH_CLIENT", "AUTHOR_AUTH_TOKEN", "db_password"] {
+            assert!(secret_name(k), "{k}");
+        }
     }
 }
