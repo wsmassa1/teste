@@ -3,6 +3,7 @@
 use crate::clients::{Client, Format, Host, SERVER_NAME, clients, is_owned_entry};
 use crate::config;
 use crate::skill;
+use craft_anything_engine::settings::SETTINGS_VERSION;
 use craft_anything_evidence::{ErrorCode, ToolError};
 use serde::Serialize;
 use serde_json::Value;
@@ -411,17 +412,41 @@ pub fn verify(c: &Client, path: &Path, desired: &Value) -> Result<(), ToolError>
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UninstallReport {
-    /// `removed`, `nothing_to_remove`, `blocked` or `partial`.
+    /// `removed`, `nothing_to_remove`, `blocked` or `partial`. `removed`
+    /// also covers making the app config inert; `nothing_to_remove` means
+    /// nothing was removed and the app config was already inert or absent;
+    /// `partial` means something was left live — a client entry that failed
+    /// to remove, or an app config (or its pending sidecar) that could not
+    /// be made inert safely.
     pub status: &'static str,
     pub removed_entries: Vec<FileResult>,
     pub removed_skill_files: Vec<PathBuf>,
+    /// The app's own `config.toml` when uninstall made it inert.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neutralized_config: Option<PathBuf>,
+    /// The deferred `config.pending.toml` sidecar when uninstall made it
+    /// inert. A shutdown may defer non-AI edits there; the next
+    /// `Settings::load()` merges them back into `config.toml`, so the sidecar
+    /// is neutralized in place too, keeping its other edits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neutralized_pending_config: Option<PathBuf>,
+    /// Why the app's `config.toml` (or its pending sidecar) is still live:
+    /// it was left alone because it could not be made inert safely
+    /// (unreadable, malformed or newer), or the write/read-back failed.
+    /// Absent when the file is missing or already inert.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_config_error: Option<String>,
     /// Configs that stopped the uninstall (malformed or unreadable).
     pub blocking: Vec<Action>,
     pub kept: Vec<String>,
 }
 
-/// Remove our registrations and skill files, and nothing else. If any config can't be read
-/// safely, nothing at all is removed.
+/// Remove our registrations and skill files, and make the app's own config inert so the
+/// app stops executing tools on its own. If any client config can't be read safely,
+/// nothing at all is removed. A malformed or newer app config is left alone and reported.
+/// The settings path is the one the app actually loads (`Host::settings_path`),
+/// and a deferred `config.pending.toml` sidecar is neutralized in place too,
+/// keeping its unrelated edits.
 pub fn uninstall(host: &Host) -> UninstallReport {
     let all = clients(host);
     let mut blocking = Vec::new();
@@ -449,7 +474,16 @@ pub fn uninstall(host: &Host) -> UninstallReport {
     }
     let kept = vec!["Projects, evidence and settings".into(), "Other MCP servers and unrelated skills".into(), "Analysis engines".into()];
     if !blocking.is_empty() {
-        return UninstallReport { status: "blocked", removed_entries: Vec::new(), removed_skill_files: Vec::new(), blocking, kept };
+        return UninstallReport {
+            status: "blocked",
+            removed_entries: Vec::new(),
+            removed_skill_files: Vec::new(),
+            neutralized_config: None,
+            neutralized_pending_config: None,
+            app_config_error: None,
+            blocking,
+            kept,
+        };
     }
     let mut removed_entries = Vec::new();
     let mut partial = false;
@@ -479,12 +513,165 @@ pub fn uninstall(host: &Host) -> UninstallReport {
     dirs.sort();
     dirs.dedup();
     let removed_skill_files: Vec<PathBuf> = dirs.iter().flat_map(|d| skill::uninstall(d)).collect();
-    let status = if partial {
+    let app_config = host.settings_path();
+    let (neutralized_config, app_config_error, app_config_live) = neutralize_app_config(&app_config);
+    // A busy shutdown defers non-AI edits to `config.pending.toml`, and the
+    // next `Settings::load()` merges them back into `config.toml` — so a
+    // sidecar with auto_mode on would undo the neutralization above. Make it
+    // inert in place too, keeping its unrelated edits; if it cannot be made
+    // safe, the uninstall is partial rather than a success.
+    let pending_path = app_config.with_extension("pending.toml");
+    let (neutralized_pending_config, pending_error, pending_live) = neutralize_app_config(&pending_path);
+    let app_config_error = match (app_config_error, pending_error) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    };
+    let status = if partial || app_config_live || pending_live {
         "partial"
-    } else if removed_entries.is_empty() && removed_skill_files.is_empty() {
+    } else if removed_entries.is_empty() && removed_skill_files.is_empty() && neutralized_config.is_none() && neutralized_pending_config.is_none() {
         "nothing_to_remove"
     } else {
         "removed"
     };
-    UninstallReport { status, removed_entries, removed_skill_files, blocking, kept }
+    UninstallReport { status, removed_entries, removed_skill_files, neutralized_config, neutralized_pending_config, app_config_error, blocking, kept }
+}
+
+/// Make a `config.toml` text inert: `auto_mode = false` and every
+/// `[[ai.backends]]` entry `enabled = false`. A backend without an `enabled`
+/// key counts as on — `BackendConfig::enabled` defaults to true, as does
+/// `Settings::default` for auto mode — so the key is written explicitly.
+/// Returns the new text when anything changed, `None` when it is already
+/// inert. `deep_mode` is left alone: the issue only asks for automatic
+/// execution to stop, and `deep_mode` on its own does not run anything.
+fn inert_config_text(text: &str) -> Result<Option<String>, String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("not valid TOML: {e}"))?;
+    // Same version rules as `Settings::read_settings`: missing means 0, a
+    // non-integer or negative version is broken, a newer version is left alone.
+    let version = match doc.get("version") {
+        None => 0,
+        Some(v) => v.as_integer().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| format!("its version ({v}) isn't a whole number"))?,
+    };
+    if version > SETTINGS_VERSION {
+        return Err(format!("version {version} is newer than this build understands (max {SETTINGS_VERSION}); left alone"));
+    }
+    let mut changed = false;
+    match doc.get_mut("auto_mode") {
+        None => {
+            doc["auto_mode"] = toml_edit::value(false);
+            changed = true;
+        }
+        Some(item) => match item.as_bool() {
+            Some(true) => {
+                *item = toml_edit::value(false);
+                changed = true;
+            }
+            Some(false) => {}
+            None => return Err("auto_mode isn't true or false".to_string()),
+        },
+    }
+    if let Some(ai) = doc.get_mut("ai") {
+        let Some(table) = ai.as_table_mut() else {
+            return Err("ai isn't a table".to_string());
+        };
+        if let Some(backends) = table.get_mut("backends") {
+            changed |= disable_backends(backends)?;
+        }
+    }
+    Ok(if changed { Some(doc.to_string()) } else { None })
+}
+
+/// Set `enabled = false` on every backend entry. `[[ai.backends]]` parses
+/// as an array of tables; an inline `ai.backends = [...]` array is accepted
+/// too. Returns whether anything changed.
+fn disable_backends(backends: &mut toml_edit::Item) -> Result<bool, String> {
+    let mut changed = false;
+    if let Some(tables) = backends.as_array_of_tables_mut() {
+        for table in tables.iter_mut() {
+            changed |= disable_backend(table)?;
+        }
+        return Ok(changed);
+    }
+    let Some(array) = backends.as_array_mut() else {
+        return Err("ai.backends isn't an array of tables".to_string());
+    };
+    for entry in array.iter_mut() {
+        let Some(table) = entry.as_inline_table_mut() else {
+            return Err("an ai.backends entry isn't a table".to_string());
+        };
+        // Inline tables hold `Value`s, not `Item`s, so the same disable
+        // logic as `disable_backend` with `Value::from(false)`.
+        match table.get_mut("enabled") {
+            None => {
+                table["enabled"] = toml_edit::Value::from(false);
+                changed = true;
+            }
+            Some(item) => match item.as_bool() {
+                Some(true) => {
+                    *item = toml_edit::Value::from(false);
+                    changed = true;
+                }
+                Some(false) => {}
+                None => return Err("an ai.backends enabled isn't true or false".to_string()),
+            },
+        }
+    }
+    Ok(changed)
+}
+
+/// Set `enabled = false` on one backend table, writing the key when it is
+/// missing (a backend without `enabled` counts as on). Returns whether
+/// anything changed.
+fn disable_backend(table: &mut toml_edit::Table) -> Result<bool, String> {
+    match table.get_mut("enabled") {
+        None => {
+            table["enabled"] = toml_edit::value(false);
+            Ok(true)
+        }
+        Some(item) => match item.as_bool() {
+            Some(true) => {
+                *item = toml_edit::value(false);
+                Ok(true)
+            }
+            Some(false) => Ok(false),
+            None => Err("an ai.backends enabled isn't true or false".to_string()),
+        },
+    }
+}
+
+/// Make the app's own `config.toml` inert in place, keeping every other
+/// setting. Returns `(neutralized path, note, still_live)`: at most one of
+/// the first two is `Some`. A missing or already-inert file is `(None, None,
+/// false)`; a file left alone while possibly live (unreadable, malformed or
+/// newer) carries the reason as a note with `still_live` true, as does a
+/// failed write or read-back — either way the caller must not report
+/// success, since automatic execution may still be on.
+fn neutralize_app_config(path: &Path) -> (Option<PathBuf>, Option<String>, bool) {
+    let old = match read_text(path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return (None, None, false),
+        Err(e) => return (None, Some(format!("{} can't be read: {e}", path.display())), true),
+    };
+    let new = match inert_config_text(&old) {
+        Ok(Some(text)) => text,
+        Ok(None) => return (None, None, false),
+        Err(e) => return (None, Some(format!("{} left alone: {e}", path.display())), true),
+    };
+    let backup = backup_path(path);
+    let result = craft_anything_platform::backup_once(path, &backup)
+        .and_then(|_| craft_anything_platform::write_atomic_private(path, new.as_bytes()))
+        .and_then(|_| match std::fs::read_to_string(path).map_err(|e| ToolError::io(path.display(), e)) {
+            Ok(text) => match inert_config_text(&text) {
+                Ok(None) => Ok(()),
+                _ => Err(ToolError::new(ErrorCode::FileError, "the config is still live after neutralizing")),
+            },
+            Err(e) => Err(e),
+        });
+    match result {
+        Ok(()) => (Some(path.to_path_buf()), None, false),
+        Err(e) => {
+            let restored = craft_anything_platform::write_atomic(path, old.as_bytes()).is_ok();
+            let message = if restored { e.message } else { format!("{} Restore {} by hand.", e.message, backup.display()) };
+            (None, Some(message), true)
+        }
+    }
 }

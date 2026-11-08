@@ -174,6 +174,15 @@ pub fn uninstall(_a: &UninstallArgs, f: Format) -> u8 {
         for p in &report.removed_skill_files {
             out(&format!("removed {}", p.display()));
         }
+        if let Some(p) = &report.neutralized_config {
+            out(&format!("made inert {} (auto_mode off, all AI backends disabled)", p.display()));
+        }
+        if let Some(p) = &report.neutralized_pending_config {
+            out(&format!("made inert {} (pending settings, auto_mode off)", p.display()));
+        }
+        if let Some(e) = &report.app_config_error {
+            out(&format!("app config: {e}"));
+        }
         for b in &report.blocking {
             out(&format!("blocked by {} — fix or move that file first", b.display));
         }
