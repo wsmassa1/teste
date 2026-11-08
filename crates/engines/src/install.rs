@@ -245,8 +245,7 @@ pub fn download_to(
     })?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
-        return Err(ToolError::new(ErrorCode::EngineMissing, format!("The download server answered {status} for {url}."))
-            .with_remediation("The URL may have moved; update the pinned URL."));
+        return Err(status_error(status, url));
     }
     let total = resp.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok());
     let mut reader = resp.into_body().into_reader().take(max_bytes + 1);
@@ -270,6 +269,17 @@ pub fn download_to(
         progress(got, total);
     }
     Ok(got)
+}
+
+/// A download that answered `status`, and what the person can do about it. A busy or failing
+/// server (#1193: GitHub's 504) clears up by itself; only a file gone from its address needs us.
+fn status_error(status: u16, url: &str) -> ToolError {
+    let remediation = match status {
+        429 | 500..=599 => "The download server is busy or having trouble. Try again in a few minutes.",
+        404 | 410 => "The file isn't at its usual address any more. Please report this so Craft Anything can be updated.",
+        _ => "Try again later. If it keeps happening, please report it.",
+    };
+    ToolError::new(ErrorCode::EngineMissing, format!("The download server answered {status} for {url}.")).with_remediation(remediation)
 }
 
 /// Unpack a verified archive of `format` into `dest`, stripping `strip_prefix` and skipping unsafe
@@ -442,6 +452,22 @@ fn set_executable(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server error says to try later, not to change a pin the person can't change (#1193).
+    #[test]
+    fn a_download_status_says_what_the_person_can_do() {
+        let advice = |s| status_error(s, "https://example.invalid/x").remediation.unwrap_or_default();
+        for s in [504, 500, 503, 429] {
+            assert!(advice(s).contains("Try again in a few minutes"), "{s}");
+        }
+        for s in [404, 410] {
+            assert!(advice(s).contains("report this"), "{s}");
+        }
+        for s in [200, 403, 504, 404] {
+            assert!(!advice(s).contains("pinned URL"), "{s}");
+        }
+        assert_eq!(status_error(504, "https://example.invalid/x").message, "The download server answered 504 for https://example.invalid/x.");
+    }
 
     /// A real install, only where `CRAFT_ANYTHING_TEST_INSTALL` names an engine (it downloads)
     /// and `CRAFT_ANYTHING_TEST_INSTALL_STORE` a folder to install into: the pin downloads,
