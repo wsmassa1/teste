@@ -44,6 +44,7 @@ impl Conversation for NotesDuringPoll {
     }
 }
 
+/// A consumed note is only acknowledged once the turn finishes, so progress isn't read mid-turn.
 #[test]
 fn consumed_notes_wait_for_turn_done_before_accessing_progress() {
     for directory in [false, true] {
@@ -60,7 +61,7 @@ fn consumed_notes_wait_for_turn_done_before_accessing_progress() {
             polls: 0,
             sends: 0,
         };
-        let result = worker.turn_with_wait(&mut ws, &mut agent, "Apply the notes", None, |_, _| panic!("a local record cannot retry the builder"));
+        let result = worker.turn_with_wait(&mut ws, &mut agent, "Apply the notes", true, None, |_, _| panic!("a local record cannot retry the builder"));
         assert_eq!(result.unwrap(), "Finished the edit");
         assert_eq!((agent.sends, agent.polls), (1, 2), "keep polling the existing request until TurnDone");
         assert!(!agent.is_busy());

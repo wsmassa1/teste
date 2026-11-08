@@ -19,6 +19,13 @@
         "null"
       ]
     },
+    "agent_session_deep": {
+      "description": "The mode `agent_session` was saved in (`true`: Deep); none: saved before the mode was\nkept, so it is only resumed in Deep (it may have read the original there).",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "allowed_actions": {
       "description": "Kinds of agent action the person allowed for this workspace (\"bash:npm\", \"web_fetch\"…).",
       "type": "array",

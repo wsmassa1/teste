@@ -663,7 +663,7 @@ impl Worker {
             deep,
             targets,
             logs: Some(crate::failure_log::dir_in(&config_dir)),
-            resume: ws.manifest.agent_session.clone(),
+            resume: ws.manifest.agent_session_for_mode(&entry.config.model, deep).map(str::to_string),
             preamble: Some(
                 "You work inside Craft Anything for a person who doesn't code. The message below is your task.
 
@@ -749,24 +749,33 @@ impl Worker {
         if !api_loop && ws.manifest.agent_session_by.as_deref() != Some(entry.config.model.as_str()) {
             ws.manifest.agent_session = ws.manifest.agent_session_for(&entry.config.model).map(str::to_string);
             ws.manifest.agent_session_by = Some(entry.config.model.clone());
+            if ws.manifest.agent_session.is_none() {
+                ws.manifest.agent_session_deep = None;
+            }
             ws.save()?;
         }
+        // The run's mode comes from the same read as the resume decision: a settings change while
+        // the run starts can't make the brief, the tool server and the recorded session disagree.
+        let spec = self.agent_spec(ws, &entry, opts);
+        let deep = spec.deep;
+        // A session from the other mode is not resumed (it may have read the original there),
+        // so the builder needs the brief as if it had none.
+        let resumed = spec.resume.is_some();
         // A coding agent on this computer whose session the project keeps a copy of (#451).
         let keeper = (!api_loop && !remote).then(|| opts.adapters.for_backend(&entry.config.model, &entry.options));
-        if let Some(a) = &keeper {
+        if resumed && let Some(a) = &keeper {
             self.restore_session(ws, a.as_ref());
         }
-        // A coding agent that never saved a session starts over, so it needs the brief.
-        let has_history = resumable && (api_loop || ws.manifest.agent_session.is_some());
         self.step(ws, Step::Build, Status::Building, "Getting the builder ready…")?;
-        let spec = self.agent_spec(ws, &entry, opts);
+        // A coding agent that never saved a session starts over, so it needs the brief.
+        let has_history = resumable && (api_loop || resumed);
         let mut agent: Box<dyn Conversation> = match api {
             Some(a) => Box::new(a),
             None => crate::cli_agents::builder_conversation(spec, self.approver(ws)),
         };
         // The builder's tool server is started in this run's mode (`--deep` or `--clean-room`).
         let s = self.engine.session();
-        let (deep, ghidra) = (!s.clean_room(), s.settings.ghidra_launcher().is_some());
+        let ghidra = s.settings.ghidra_launcher().is_some();
         let image_model = s.settings.assets.image_model.clone();
         drop(s);
         let cx = BriefCx { ws, deep, ghidra, editor: self.editor.as_deref(), assets: self.assets, image_model: image_model.as_deref() };
@@ -789,7 +798,7 @@ impl Worker {
         }
         // A saved session may not be on this computer (the project was copied here): then a new
         // one starts from the brief and what the project already has.
-        let mut fresh = (!api_loop && ws.manifest.agent_session.is_some()).then(|| {
+        let mut fresh = (!api_loop && resumed).then(|| {
             let handoff = keeper.as_ref().and_then(|a| a.handoff(&kept_session(ws)?, HANDOFF_CHARS));
             resumed_elsewhere(&brief(kind, &cx, opts.message.as_deref()), &ws.manifest.last_reply, handoff.as_deref())
         });
@@ -812,7 +821,7 @@ impl Worker {
         }
         let mut refinements = 0;
         // Deep mode on a program: decompiling is required, so a build turn without any gets one reminder.
-        let must_decompile = !self.engine.session().clean_room() && matches!(ws.manifest.target, TargetRef::Local { .. });
+        let must_decompile = deep && matches!(ws.manifest.target, TargetRef::Local { .. });
         let mut reminded = false;
         // The builder finished and only the check didn't: the build is there to check.
         let mut only_check = carrying_on && !first && opts.message.is_none() && ws.manifest.awaiting_check;
@@ -833,7 +842,7 @@ impl Worker {
                 };
                 self.step(ws, Step::Build, Status::Building, doing)?;
                 ws.manifest.awaiting_check = false;
-                let reply = self.turn(ws, agent.as_mut(), &prompt, fresh.take());
+                let reply = self.turn(ws, agent.as_mut(), &prompt, deep, fresh.take());
                 // Kept even when the turn failed: the conversation is still worth carrying.
                 if let Some(a) = &keeper {
                     self.keep_session(ws, a.as_ref());
@@ -1092,8 +1101,8 @@ impl Worker {
 
     /// `fresh`: what to send instead when the agent's saved session turns out not to be on this
     /// computer.
-    fn turn(&mut self, ws: &mut Workspace, agent: &mut dyn Conversation, prompt: &str, fresh: Option<String>) -> Result<String, ToolError> {
-        self.turn_with_wait(ws, agent, prompt, fresh, |stop, seconds| {
+    fn turn(&mut self, ws: &mut Workspace, agent: &mut dyn Conversation, prompt: &str, deep: bool, fresh: Option<String>) -> Result<String, ToolError> {
+        self.turn_with_wait(ws, agent, prompt, deep, fresh, |stop, seconds| {
             for _ in 0..seconds {
                 stop.check()?;
                 std::thread::sleep(Duration::from_secs(1));
@@ -1102,11 +1111,21 @@ impl Worker {
         })
     }
 
+    /// Keep the session the agent reported, with the mode it ran in; a lost one leaves neither.
+    fn remember_session(ws: &mut Workspace, session: Option<String>, deep: bool) -> Result<(), ToolError> {
+        ws.manifest.agent_session_deep = session.is_some().then_some(deep);
+        ws.manifest.agent_session = session;
+        ws.save()
+    }
+
+    /// Run one turn, retrying what the adapter calls retryable, and keep the session it reports
+    /// with the mode this run started in.
     fn turn_with_wait(
         &mut self,
         ws: &mut Workspace,
         agent: &mut dyn Conversation,
         prompt: &str,
+        deep: bool,
         mut fresh: Option<String>,
         mut wait_for: impl FnMut(&CancelToken, u64) -> Result<(), ToolError>,
     ) -> Result<String, ToolError> {
@@ -1118,11 +1137,9 @@ impl Worker {
             let lost = result.is_err() && agent.session_lost();
             if lost {
                 // The id is for a session this computer doesn't have: never ask for it again.
-                ws.manifest.agent_session = None;
-                ws.save()?;
+                Self::remember_session(ws, None, deep)?;
             } else if let Some(id) = agent.session_id() {
-                ws.manifest.agent_session = Some(id);
-                ws.save()?;
+                Self::remember_session(ws, Some(id), deep)?;
             }
             match result {
                 Err(_) if lost && let Some(f) = fresh.take() => {

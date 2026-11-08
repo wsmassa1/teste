@@ -57,6 +57,12 @@ pub struct Answered {
     pub builder_notice: Option<String>,
 }
 
+/// Where a question's answer comes from: the builder's session only when the project has one for
+/// this mode (the caller filters it) and the adapter can continue it; otherwise the files.
+fn answered_from(session: Option<&str>, resumes: bool) -> AnsweredFrom {
+    if session.is_some() && resumes { AnsweredFrom::BuildersSession } else { AnsweredFrom::TheFiles }
+}
+
 /// Answer `question` about `ws` (see the module docs), with the person's `settings` (taken from
 /// the caller, which may hold the session: a tool does while it runs, so locking it here would
 /// wait forever). Blocks until it's answered, `cancel` is set, or [`WAIT`] passes: call it off
@@ -90,14 +96,14 @@ pub fn ask(
     };
     let (mut conv, mut from): (Box<dyn Conversation>, AnsweredFrom) = match entry.config.kind {
         BackendKind::AgentCli => {
-            let session = ws.manifest.agent_session_for(&entry.config.model).map(str::to_string);
+            let session = ws.manifest.agent_session_for_mode(&entry.config.model, deep).map(str::to_string);
             if let Some(id) = session.as_deref() {
                 bring_back_session(ws, &entry, id);
             }
             // Only a native adapter that resumes can answer from a copy of the builder's chat.
             // Copilot's ACP question starts fresh, even when the project has a saved session id.
             let native_session = crate::cli_agents::adapter_for(&entry.config.model).resumes();
-            let from = if session.is_some() && native_session { AnsweredFrom::BuildersSession } else { AnsweredFrom::TheFiles };
+            let from = answered_from(session.as_deref(), native_session);
             let spec = CliSpec {
                 question: true,
                 deep,
@@ -170,6 +176,7 @@ fn forget_lost_session(root: &Path, lost: &str) -> Result<bool, ToolError> {
         return Ok(false);
     }
     now.manifest.agent_session = None;
+    now.manifest.agent_session_deep = None;
     now.save()?;
     Ok(true)
 }
@@ -288,6 +295,22 @@ mod tests {
         assert!(PREAMBLE.contains("may still be running"));
     }
 
+    /// The user-visible half of R2.9: a Deep session isn't used for a Clean room question, and an
+    /// adapter that can't resume answers from the files even when the mode matches.
+    #[test]
+    fn a_question_answers_from_the_session_only_in_the_mode_it_was_saved_in() {
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+        ws.manifest.agent_session = Some("s1".into());
+        ws.manifest.agent_session_by = Some("claude-code".into());
+        ws.manifest.agent_session_deep = Some(true);
+        let deep = ws.manifest.agent_session_for_mode("claude-code", true);
+        assert_eq!(answered_from(deep, true), AnsweredFrom::BuildersSession);
+        let clean = ws.manifest.agent_session_for_mode("claude-code", false);
+        assert_eq!(answered_from(clean, true), AnsweredFrom::TheFiles, "a Deep session isn't used in Clean room");
+        assert_eq!(answered_from(deep, false), AnsweredFrom::TheFiles, "an adapter that can't resume answers from the files");
+    }
+
     /// A question that finds the builder's session missing forgets it, unless a build has saved
     /// another meanwhile: then that one stays.
     #[test]
@@ -295,17 +318,22 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
         ws.manifest.agent_session = Some("gone".into());
+        ws.manifest.agent_session_deep = Some(true);
         ws.manifest.last_reply = "Built it.".into();
         ws.save().unwrap();
         assert!(forget_lost_session(&ws.root, "gone").unwrap());
         let now = Workspace::open(&ws.root).unwrap();
         assert_eq!(now.manifest.agent_session, None);
+        assert_eq!(now.manifest.agent_session_deep, None, "the mode goes with the session");
         assert_eq!(now.manifest.last_reply, "Built it.", "nothing else changes");
 
         ws.manifest.agent_session = Some("new-from-a-build".into());
+        ws.manifest.agent_session_deep = Some(false);
         ws.save().unwrap();
         assert!(!forget_lost_session(&ws.root, "gone").unwrap());
-        assert_eq!(Workspace::open(&ws.root).unwrap().manifest.agent_session.as_deref(), Some("new-from-a-build"));
+        let kept = Workspace::open(&ws.root).unwrap();
+        assert_eq!(kept.manifest.agent_session.as_deref(), Some("new-from-a-build"));
+        assert_eq!(kept.manifest.agent_session_deep, Some(false), "a session a build saved since keeps its mode");
 
         assert!(forget_lost_session(&d.path().join("no-such-project"), "gone").is_err(), "an error, never a panic");
     }
