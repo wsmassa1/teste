@@ -50,6 +50,21 @@ impl<'a> DetectCx<'a> {
     }
 }
 
+/// Estonian website words: *veebileht*, *koduleht* and *veebisait* with their inflected forms.
+/// *veebilehitseja* (a browser) is not a website.
+fn is_site_word(w: &str) -> bool {
+    (w.starts_with("veebileh") || w.starts_with("koduleh") || w.starts_with("veebisai")) && !w.starts_with("veebilehitseja")
+}
+
+/// Whether an Estonian word is in a case that marks a complement (source, means, place or topic)
+/// rather than the head of a noun phrase: elative (-st), comitative (-ga), adessive (-l),
+/// allative (-le), ablative (-lt), inessive (-s), illative (-sse), translative (-ks),
+/// terminative (-ni), abessive (-ta) or essive (-na). The longer endings come first.
+fn is_complement_case(w: &str) -> bool {
+    const ENDINGS: &[&str] = &["sse", "st", "ga", "le", "lt", "ks", "ni", "ta", "na", "l", "s"];
+    ENDINGS.iter().any(|e| w.ends_with(e))
+}
+
 /// What the brief is written from.
 pub struct BriefCx<'a> {
     pub ws: &'a Workspace,

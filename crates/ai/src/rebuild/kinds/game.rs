@@ -100,6 +100,7 @@ impl TargetKind for GameKind {
                 "เกม",
             ])
             || says_game_in_spanish(cx)
+            || says_game_in_estonian(cx)
         {
             Some(60)
         } else {
@@ -207,6 +208,65 @@ impl Check for CreditsCheck {
 fn says_game_in_spanish(cx: &DetectCx) -> bool {
     let tool_set = cx.says(&["juego de herramienta"]);
     (cx.says(&[" juego", " juegos"]) && !tool_set) || cx.says(&["jugabilidad", "videojuego"])
+}
+
+/// Estonian for "game" is *mäng*: its noun forms end in *mäng* or one of its case endings
+/// (*mängu*, *mängus*, *mängud*…), and compounds end the same way (*usumäng*, *lauamäng*). The
+/// verb *mängima* ("to play") and its forms begin with *mängi* (*mängiv*, *mängib*), so suffix
+/// matching keeps an app that plays music an app.
+///
+/// When the request names both a game and a website, the head of the main clause is the thing to
+/// build. The head is the last cue before the first comma (and before *nimega*, a name); a cue in
+/// a complement case marks a source or topic, not the head. So *Tee sellest mängust veebileht* is
+/// a website, while *Loo mäng nimega Veebileht* is a game.
+fn says_game_in_estonian(cx: &DetectCx) -> bool {
+    let words = main_clause_words(cx);
+    let game = last_head(&words, is_game_word);
+    let site = last_head(&words, is_site_word);
+    match (game, site) {
+        (Some(g), Some(s)) => g > s,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// The words of the request's main clause: before the first comma and before *nimega* (a name).
+fn main_clause_words<'a>(cx: &'a DetectCx) -> Vec<&'a str> {
+    let before_comma = cx.request.split(',').next().unwrap_or(&cx.request);
+    let count = before_comma.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).count();
+    let mut words: Vec<&str> = cx.words.split_whitespace().take(count).collect();
+    if let Some(at) = words.iter().position(|w| *w == "nimega") {
+        words.truncate(at);
+    }
+    words
+}
+
+/// The last word that names the thing (not a complement) is the head of an Estonian noun phrase.
+fn last_head(words: &[&str], cue: fn(&str) -> bool) -> Option<usize> {
+    words.iter().enumerate().rev().find(|(_, w)| cue(w) && !is_complement_case(w)).map(|(i, _)| i)
+}
+
+fn is_game_word(w: &str) -> bool {
+    const FORMS: &[&str] = &[
+        "mäng",
+        "mängu",
+        "mängus",
+        "mängust",
+        "mängule",
+        "mängul",
+        "mänguga",
+        "mängud",
+        "mänge",
+        "mängude",
+        "mängudes",
+        "mängudest",
+        "mängudele",
+        "mängudel",
+        "mängudega",
+        "mängusid",
+        "mänguks",
+    ];
+    FORMS.iter().any(|f| w.ends_with(f))
 }
 
 fn credits(app: &Path) -> (bool, String) {

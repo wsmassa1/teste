@@ -167,7 +167,8 @@ impl TargetKind for WebsiteKind {
             "網站",
             "网页",
             "網頁",
-        ]) {
+        ]) || says_site_in_estonian(cx)
+        {
             Some(50)
         } else if matches!(cx.target, TargetRef::None) && stacks::get(cx.stack).is_some_and(|s| s.site) {
             // Built as a site with nothing to recreate: "add a contact form" never says website.
@@ -514,6 +515,12 @@ fn rgba(c: &str) -> Option<[u8; 4]> {
 }
 
 /// The same colour to the eye: each channel within 3 (rounding in the browser), or the same text.
+/// Whether the request names a website in Estonian. `DetectCx::words` turns punctuation and
+/// newlines into spaces, so a cue after them still counts.
+fn says_site_in_estonian(cx: &DetectCx) -> bool {
+    cx.words.split_whitespace().any(is_site_word)
+}
+
 fn same_colour(a: &str, b: &str) -> bool {
     match (rgba(a), rgba(b)) {
         (Some(x), Some(y)) => x.iter().zip(y).all(|(p, q)| p.abs_diff(q) <= 3),

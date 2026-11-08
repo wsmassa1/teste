@@ -185,6 +185,38 @@ fn thai_requests_keep_their_project_kind() {
 }
 
 #[test]
+fn estonian_requests_keep_their_project_kind() {
+    for request in ["Lihtne usumäng", "Sama mäng, aga edetabeliga", "Loo mäng, mis mängib nii", "Loo mänge lastele"] {
+        assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
+    }
+    for request in ["Veebileht minu pagaritöökojale", "Loo see veebileht uuesti", "Veebileht minu töökojale"] {
+        assert_eq!(choose(request, &TargetRef::None), ("website", stacks::BUILDERS_CHOICE), "{request}");
+    }
+    assert_eq!(choose("Sama rakendus, aga lihtsam", &TargetRef::None).0, "app");
+    // A game noun keeps its kind in compounds and inflected forms; the verb "mängima" (to play)
+    // and toy compounds do not.
+    for request in ["Lauamäng", "Arvutimängu uus versioon"] {
+        assert_eq!(choose(request, &TargetRef::None).0, "game", "{request}");
+    }
+    for request in ["Loo muusikat mängiv rakendus", "Mänguasjapood"] {
+        assert_eq!(choose(request, &TargetRef::None).0, "app", "{request}");
+    }
+    // Punctuation and newlines still expose the website cues, and a browser is not a website.
+    for request in ["Loo:\nveebileht pagaritöökojale", "Kodulehele"] {
+        assert_eq!(choose(request, &TargetRef::None).0, "website", "{request}");
+    }
+    assert_eq!(choose("Ava veebilehitseja", &TargetRef::None).0, "app");
+    // The head of the main clause decides when both are named: a game used as the source or
+    // topic is not the build.
+    for request in ["Tee sellest mängust veebileht", "Mängude veebileht", "Loo veebileht, kus müüakse mänge", "Veebileht mängust"] {
+        assert_eq!(choose(request, &TargetRef::None).0, "website", "{request}");
+    }
+    for request in ["Tee sellest veebilehest mäng", "Loo mäng nimega Veebileht", "Mäng veebilehega"] {
+        assert_eq!(choose(request, &TargetRef::None).0, "game", "{request}");
+    }
+}
+
+#[test]
 fn chinese_requests_keep_their_project_kind() {
     for request in ["一个简单的贪吃蛇游戏", "簡單的貪食蛇遊戲", "复刻它的玩法"] {
         assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
